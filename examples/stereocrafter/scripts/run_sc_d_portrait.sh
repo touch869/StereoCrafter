@@ -38,7 +38,7 @@ while [ $# -gt 0 ]; do
       shift;;
   esac
 done
-SC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 W="${SC_WEIGHTS:-$SC/weights}"
 mkdir -p "$OUT"
 cd "$SC"
