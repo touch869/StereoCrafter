@@ -107,9 +107,8 @@ ffmpeg -y -v error -i $OUT/left_pass_grid_inpainting_results_sbs.mp4 \
   -vf "crop=${HW}:${RH}:${HW}:0" $OUT/svd_left.mp4
 for swap in "" "_SWAPPED"; do
   if [ -z "$swap" ]; then FC="[0:v][1:v]hstack=2[v]"; else FC="[1:v][0:v]hstack=2[v]"; fi
-  ffmpeg -y -v error -i $OUT/svd_left.mp4 -i $OUT/svd_right.mp4 \
-    -filter_complex "$FC" -map "[v]" -c:v libx264 -crf 16 -pix_fmt yuv420p \
-    -i "$INPUT" -map 2:a? -c:a aac -shortest \
+  ffmpeg -y -v error -i $OUT/svd_left.mp4 -i $OUT/svd_right.mp4 -i "$INPUT" \
+    -filter_complex "$FC" -map "[v]" -map "2:a?" -c:v libx264 -crf 16 -pix_fmt yuv420p -c:a aac -shortest \
     $OUT/final_sbs${swap}.mp4
 done
 echo "[4] final SBS: $OUT/final_sbs.mp4 (+_SWAPPED)"
