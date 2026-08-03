@@ -109,6 +109,7 @@ for swap in "" "_SWAPPED"; do
   if [ -z "$swap" ]; then FC="[0:v][1:v]hstack=2[v]"; else FC="[1:v][0:v]hstack=2[v]"; fi
   ffmpeg -y -v error -i $OUT/svd_left.mp4 -i $OUT/svd_right.mp4 \
     -filter_complex "$FC" -map "[v]" -c:v libx264 -crf 16 -pix_fmt yuv420p \
+    -i "$INPUT" -map 2:a? -c:a aac -shortest \
     $OUT/final_sbs${swap}.mp4
 done
 echo "[4] final SBS: $OUT/final_sbs.mp4 (+_SWAPPED)"
