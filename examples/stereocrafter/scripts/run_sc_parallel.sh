@@ -1,17 +1,25 @@
 #!/bin/bash
-# StereoCrafter 分段 + 多卡并行 (竖屏 portrait)
+# StereoCrafter 分段 + 多卡工作池 (竖屏 portrait)
 # ==================================================
-# 把长视频切成 N 段(带 overlap), 每段在一张卡上独立跑 4 步(SC pipeline),
+# 把长视频切成 N 段(带 overlap), 每段独立跑 4 步(SC pipeline),
 # 最后按段顺序 concat 去重(overlap 区取前段尾部) + 合源音频。
 #
 # 解决: 0.mp4 (2699帧/90s) Step1 DepthCrafter 一次性全量帧上 GPU → 24G 卡 OOM。
-# 分段后每段帧张量小, 单卡不爆; 多卡并行 wall-clock ≈ 单段时长。
+# 分段后单段不爆; 多卡并行 wall-clock ≈ ceil(段数/卡数) × 单段时长。
+#
+# 段数与卡数解耦 (worker-pool):
+#   - 段数 NSEG = 全覆盖所需 (ceil(TOTAL/stride)), 与卡数无关
+#   - 段轮流(round-robin)分配到各卡, 每卡串行跑分到的段, 全部卡并行
+#   - 段数 > 卡数: 多出的段在各卡排队复用 (不漏覆盖, 修复旧版尾部漏段 bug)
+#   - 段数 < 卡数: 多出的卡空闲 (退化回 1段/卡 全并行)
+# 注: chunk 是并行粒度参数, 不是显存旋钮 (DepthCrafter 内部 window_size=70
+#     分窗, 段长不驱动峰值显存; 显存由 window_size + 1080×1920 降分辨率兜)。
 #
 # 用法:
 #   ./run_sc_parallel.sh <input.mp4> --out <dir> --gpus <0,1,2,3,4> \
 #     [--chunk-frames 600] [--overlap 25] [--max-disp 40] [--tile 2]
 #   默认: chunk-frames=600, overlap=25, max-disp=20, tile=2
-#   --gpus 逗号分隔的 GPU id 列表; 段数 = len(gpus), 每段帧数自适应
+#   --gpus 逗号分隔的 GPU id 列表; 段数自适应(全覆盖), 卡数=并行度
 # ==================================================
 
 set -e
@@ -60,53 +68,92 @@ if [ -z "$TOTAL_FR" ] || [ "$TOTAL_FR" = "0" ]; then
 fi
 echo "[0] total frames = $TOTAL_FR"
 
-# 每段帧数 = CHUNK, 段间 overlap = OVERLAP; 实际段数由 NUM_GPUS 决定
-# 段 i 的帧范围: [i*(CHUNK-OVERLAP), i*(CHUNK-OVERLAP)+CHUNK)
+# 每段帧数 = CHUNK, 段间 overlap = OVERLAP, stride = CHUNK - OVERLAP
+# 段数 NSEG = 全覆盖所需 (与卡数无关); 卡数 = 并行度
 STRIDE=$((CHUNK - OVERLAP))
+if [ "$STRIDE" -le 0 ]; then
+  echo "ERROR: chunk-frames($CHUNK) 必须 > overlap($OVERLAP) (stride=$STRIDE ≤ 0)"; exit 1
+fi
 echo "[0] chunk=$CHUNK overlap=$OVERLAP stride=$STRIDE gpus=$GPUS"
 
-SEG_FILES=()
-PIDS=()
-for i in "${!GPU_ARR[@]}"; do
-  G=${GPU_ARR[$i]}
-  START_FR=$((i * STRIDE))
-  END_FR=$((START_FR + CHUNK))
-  if [ "$START_FR" -ge "$TOTAL_FR" ]; then break; fi
-  # 最后一段不超过总帧数
-  [ "$END_FR" -gt "$TOTAL_FR" ] && END_FR=$TOTAL_FR
+# ---- Phase A: 生成全部段 (全覆盖, 段数不受卡数限制) ----
+SEG_START=()   # 每段起始帧
+SEG_END=()     # 每段结束帧 (不含)
+SEG_FILES=()   # 每段 final_sbs 路径, 按段顺序 (供 concat, 与 GPU 分配无关)
+i=0
+while :; do
+  S=$((i * STRIDE))
+  [ "$S" -ge "$TOTAL_FR" ] && break
+  E=$((S + CHUNK))
+  [ "$E" -gt "$TOTAL_FR" ] && E=$TOTAL_FR
+  SEG_START+=("$S"); SEG_END+=("$E")
+  SEG_FILES+=("$OUT/seg${i}/final_sbs.mp4")
+  # 本段已覆盖到末尾 → 停, 不切冗余短末段 (seg3 break 修复保留)
+  [ "$E" -ge "$TOTAL_FR" ] && break
+  i=$((i + 1))
+done
+NSEG=${#SEG_START[@]}
+echo "[0] 段数=$NSEG (全覆盖) on $NUM_GPUS 卡: ${GPU_ARR[*]} → 每卡约 $(( (NSEG + NUM_GPUS - 1) / NUM_GPUS )) 段"
+[ "$NSEG" -lt 1 ] && { echo "ERROR: 视频帧数为 0, 无段可切"; exit 1; }
 
+# ---- Phase B: 切片 (全部段, resume 已存在跳过) ----
+for ((i=0; i<NSEG; i++)); do
   SEG_DIR="$OUT/seg${i}"
   SEG_MP4="$SEG_DIR/seg${i}.mp4"
-  SEG_FILES+=("$SEG_DIR/final_sbs.mp4")
   mkdir -p "$SEG_DIR"
-
   if [ -f "$SEG_DIR/final_sbs.mp4" ]; then
-    echo "[seg$i] RESUME: final_sbs.mp4 已存在, 跳过 (gpu=$G)"
+    echo "[seg$i] RESUME: final_sbs.mp4 已存在, 跳过切片+处理"
     continue
   fi
-
-  # 切片 (帧精确: -vf select+setpts; 段内不需要音频, 最后拼接再合源音)
-  echo "[seg$i] 切片 frames [$START_FR:$END_FR] → gpu=$G"
-  ffmpeg -y -v error -i "$AUTO" \
-    -vf "select=between(n\,${START_FR}\,$((END_FR-1))),setpts=PTS-STARTPTS" \
-    -c:v libx264 -crf 18 -an "$SEG_MP4"
-
-  # 并行启动该段 (后台)
-  echo "[seg$i] 启动 SC pipeline (gpu=$G)"
-  bash "$SCRIPT_DIR/run_sc_segment.sh" "$SEG_MP4" \
-    --out "$SEG_DIR" --gpu "$G" --max-disp "$MAXDISP" --tile "$TILE" \
-    > "$SEG_DIR/seg.log" 2>&1 &
-  PIDS+=($!)
-  # 本段已覆盖到末尾(末段, END_FR 已截到 TOTAL_FR), 下一段会是冗余短段, 不切
-  [ "$END_FR" -ge "$TOTAL_FR" ] && break
+  if [ ! -f "$SEG_MP4" ]; then
+    # 帧精确切片 (-vf select+setpts); 段内不要音频, 最后拼接再合源音
+    echo "[seg$i] 切片 frames [${SEG_START[$i]}:${SEG_END[$i]}]"
+    ffmpeg -y -v error -i "$AUTO" \
+      -vf "select=between(n\,${SEG_START[$i]}\,$((${SEG_END[$i]}-1))),setpts=PTS-STARTPTS" \
+      -c:v libx264 -crf 18 -an "$SEG_MP4"
+  fi
 done
 
-# ---- 等所有段完成 ----
-echo "[parallel] 等待 ${#PIDS[@]} 段完成..."
+# ---- Phase C: GPU 工作池 (段轮流分配, 每卡串行, 全卡并行) ----
+# 段数 > 卡数: 多出的段在各卡排队 (同卡串行) → 不漏覆盖; 段数 < 卡数: 多出的卡空闲
+run_one_segment() {   # $1=段idx  $2=真实GPU id
+  local idx="$1" gpu="$2"
+  local seg_dir="$OUT/seg${idx}"
+  [ -f "$seg_dir/final_sbs.mp4" ] && { echo "[seg$idx] RESUME skip (gpu=$gpu)"; return 0; }
+  echo "[seg$idx] 启动 SC pipeline (gpu=$gpu)"
+  bash "$SCRIPT_DIR/run_sc_segment.sh" "$seg_dir/seg${idx}.mp4" \
+    --out "$seg_dir" --gpu "$gpu" --max-disp "$MAXDISP" --tile "$TILE" \
+    > "$seg_dir/seg.log" 2>&1
+}
+gpu_worker() {        # $1=真实GPU id  剩余 $@=该卡要跑的段idx列表
+  local gpu="$1"; shift
+  for idx in "$@"; do
+    if ! run_one_segment "$idx" "$gpu"; then
+      echo "[gpu=$gpu] ERROR: seg$idx 失败 (见 $OUT/seg${idx}/seg.log)"
+      return 1
+    fi
+  done
+  return 0
+}
+
+# 轮流(round-robin)分配: 卡 g 负责 seg{g, g+NUM_GPUS, g+2*NUM_GPUS, ...}
+PIDS=()
+for g in "${!GPU_ARR[@]}"; do
+  real_gpu=${GPU_ARR[$g]}
+  assign=()
+  for ((j=g; j<NSEG; j+=NUM_GPUS)); do assign+=("$j"); done
+  [ ${#assign[@]} -eq 0 ] && continue
+  echo "[gpu=$real_gpu] 分配 ${#assign[@]} 段: ${assign[*]}"
+  gpu_worker "$real_gpu" "${assign[@]}" &
+  PIDS+=($!)
+done
+
+# ---- 等所有 GPU 工作进程完成 ----
+echo "[parallel] 等待 ${#PIDS[@]} 个 GPU 工作进程 (共 $NSEG 段)..."
 FAIL=0
 for pid in "${PIDS[@]}"; do
   if ! wait "$pid"; then
-    echo "[parallel] ERROR: 段进程 $pid 失败"
+    echo "[parallel] ERROR: 工作进程 $pid 失败"
     FAIL=1
   fi
 done
