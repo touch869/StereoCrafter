@@ -143,7 +143,12 @@ class DepthCrafterDemo:
         # normalize the depth map to [0, 1] across the whole video
         res = (res - res.min()) / (res.max() - res.min())
         # visualize the depth map and save the results
-        vis = vis_sequence_depth(res)
+        # 可视化是副产物, 不应阻断主流程 (段边界深度异常 → colormap 索引溢出)
+        try:
+            vis = vis_sequence_depth(res)
+        except Exception as e:
+            print(f"Warning: vis_sequence_depth failed ({e}), using placeholder vis")
+            vis = (res[..., None].repeat(3, axis=-1) * 255.0).astype("uint8")
         # save the depth map and visualization with the target FPS
         save_path = os.path.join(
             os.path.dirname(output_video_path), os.path.splitext(os.path.basename(output_video_path))[0]
