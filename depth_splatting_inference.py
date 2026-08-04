@@ -143,8 +143,17 @@ class DepthCrafterDemo:
         # normalize the depth map to [0, 1] across the whole video
         # 段边界(尤其短段尾部)会产生 NaN/Inf 深度值 → forward_warp assertion 崩。
         # 清洗后再 normalize (nan→0, inf→max), 保证 splatting 不断。
-        res = np.nan_to_num(res, nan=0.0, posinf=1.0, neginf=0.0)
-        res = (res - res.min()) / (res.max() - res.min())
+        # normalize the depth map to [0, 1] across the whole video
+        # 段边界(尤其末段) DepthCrafter 会吐常数/NaN 深度 → normalize 除零(max==min)→NaN
+        # 旧 nan_to_num(nan=0) 只防崩, 但 depth→0 → splatting 全错位 → 整段黑帧(seg2 97%黑)
+        # 修: epsilon 防除零; depth 退化时填中性 0.5, 保 splatting 有视差不黑
+        res = np.nan_to_num(res, nan=0.5, posinf=1.0, neginf=0.0)
+        rng = float(res.max() - res.min())
+        if rng < 1e-6:
+            print(f"[depth] WARN: depth 退化(max==min={res.max():.4f}), 填中性0.5防黑帧", flush=True)
+            res = np.full_like(res, 0.5)
+        else:
+            res = (res - res.min()) / rng
         # visualize the depth map and save the results
         # 可视化是副产物, 不应阻断主流程 (段边界深度异常 → colormap 索引溢出)
         try:

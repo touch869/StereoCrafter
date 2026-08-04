@@ -147,10 +147,10 @@ ffmpeg -y -v error -f concat -safe 0 -i "$CONCAT_LIST" \
 ffmpeg -y -v error -i "$OUT/final_sbs_video.mp4" -i "$AUTO" \
   -map 0:v -map 1:a? -c:v copy -c:a aac -shortest "$OUT/final_sbs.mp4"
 
-# SWAPPED 版 (左右眼交换)
+# SWAPPED 版 (左右眼交换) — 修: 漏了 -map 0:a 导致无声
 ffmpeg -y -v error -i "$OUT/final_sbs.mp4" \
   -filter_complex "[0:v]crop=iw/2:ih:0:0[l];[0:v]crop=iw/2:ih:iw/2:0[r];[r][l]hstack[v]" \
-  -map "[v]" -c:v libx264 -crf 16 -pix_fmt yuv420p -c:a aac "$OUT/final_sbs_SWAPPED.mp4"
+  -map "[v]" -map 0:a? -c:v libx264 -crf 16 -pix_fmt yuv420p -c:a aac "$OUT/final_sbs_SWAPPED.mp4"
 
 echo ""
 echo "ALL DONE → $OUT/final_sbs.mp4 (+_SWAPPED)"
