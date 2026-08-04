@@ -141,6 +141,9 @@ class DepthCrafterDemo:
         res = res.cpu().numpy()[:,0,:,:]
         
         # normalize the depth map to [0, 1] across the whole video
+        # 段边界(尤其短段尾部)会产生 NaN/Inf 深度值 → forward_warp assertion 崩。
+        # 清洗后再 normalize (nan→0, inf→max), 保证 splatting 不断。
+        res = np.nan_to_num(res, nan=0.0, posinf=1.0, neginf=0.0)
         res = (res - res.min()) / (res.max() - res.min())
         # visualize the depth map and save the results
         # 可视化是副产物, 不应阻断主流程 (段边界深度异常 → colormap 索引溢出)
@@ -249,8 +252,11 @@ def DepthSplatting(
         left_video = torch.from_numpy(batch_frames).permute(0, 3, 1, 2).float().cuda()
         disp_map = torch.from_numpy(batch_depth).unsqueeze(1).float().cuda()
 
+        # 兜住 normalize 除零/段边界产生的 NaN/Inf, 否则 forward_warp assertion 崩
+        disp_map = torch.nan_to_num(disp_map, nan=0.0, posinf=max_disp, neginf=-max_disp)
         disp_map = disp_map * 2.0 - 1.0
         disp_map = disp_map * max_disp
+        disp_map = torch.nan_to_num(disp_map, nan=0.0, posinf=max_disp, neginf=-max_disp)
 
         with torch.no_grad():
             right_video, occlusion_mask = stereo_projector(left_video, disp_map)
