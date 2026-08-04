@@ -97,6 +97,8 @@ for i in "${!GPU_ARR[@]}"; do
     --out "$SEG_DIR" --gpu "$G" --max-disp "$MAXDISP" --tile "$TILE" \
     > "$SEG_DIR/seg.log" 2>&1 &
   PIDS+=($!)
+  # 本段已覆盖到末尾(末段, END_FR 已截到 TOTAL_FR), 下一段会是冗余短段, 不切
+  [ "$END_FR" -ge "$TOTAL_FR" ] && break
 done
 
 # ---- 等所有段完成 ----
