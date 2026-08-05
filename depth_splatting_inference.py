@@ -119,38 +119,47 @@ class DepthCrafterDemo:
         )
 
         # inference the depth map using the DepthCrafter pipeline
-        with torch.inference_mode():
-            res = self.pipe(
-                frames,
-                height=frames.shape[1],
-                width=frames.shape[2],
-                output_type="np",
-                guidance_scale=guidance_scale,
-                num_inference_steps=num_denoising_steps,
-                window_size=window_size,
-                overlap=overlap,
-                track_time=track_time,
-            ).frames[0]
+        # 偶发 NaN: DepthCrafter (扩散模型) 对某些段会随机吐全 NaN depth → splatting
+        # occlusion 全黑 → inpainting 右眼黑 → final 整段黑 (seg2 实测左右半全黑)。
+        # 根因是扩散推理的随机性, 非确定性 bug (同输入重跑, diag 验证 depth 正常)。
+        # 修: 检测退化 (max==min) 自动重跑, 扩散随机性使重跑大概率正常。
+        def _run_depthcrafter():
+            with torch.inference_mode():
+                r = self.pipe(
+                    frames,
+                    height=frames.shape[1],
+                    width=frames.shape[2],
+                    output_type="np",
+                    guidance_scale=guidance_scale,
+                    num_inference_steps=num_denoising_steps,
+                    window_size=window_size,
+                    overlap=overlap,
+                    track_time=track_time,
+                ).frames[0]
+            # convert the three-channel output to a single channel depth map
+            r = r.sum(-1) / r.shape[-1]
+            # resize the depth to the original size
+            tr = torch.tensor(r).unsqueeze(1).float().contiguous().cuda()
+            r = F.interpolate(tr, size=(original_height, original_width), mode='bilinear', align_corners=False)
+            r = r.cpu().numpy()[:,0,:,:]
+            # 清洗 NaN/Inf (段边界会产生), 否则 forward_warp assertion 崩
+            return np.nan_to_num(r, nan=0.5, posinf=1.0, neginf=0.0)
 
-        # convert the three-channel output to a single channel depth map
-        res = res.sum(-1) / res.shape[-1]
+        MAX_RETRY = 3
+        res = _run_depthcrafter()
+        for attempt in range(1, MAX_RETRY + 1):
+            rng = float(res.max() - res.min())
+            if rng >= 1e-6:
+                break
+            if attempt < MAX_RETRY:
+                print(f"[depth] WARN: depth 退化(max==min={res.max():.4f}, 偶发NaN), 重跑 DepthCrafter attempt {attempt+1}/{MAX_RETRY}", flush=True)
+                res = _run_depthcrafter()
+            else:
+                print(f"[depth] WARN: {MAX_RETRY}次重跑仍退化, 填中性0.5兜底 (该段右眼可能黑帧)", flush=True)
 
-        # resize the depth to the original size
-        tensor_res = torch.tensor(res).unsqueeze(1).float().contiguous().cuda()
-        res = F.interpolate(tensor_res, size=(original_height, original_width), mode='bilinear', align_corners=False)
-        res = res.cpu().numpy()[:,0,:,:]
-        
         # normalize the depth map to [0, 1] across the whole video
-        # 段边界(尤其短段尾部)会产生 NaN/Inf 深度值 → forward_warp assertion 崩。
-        # 清洗后再 normalize (nan→0, inf→max), 保证 splatting 不断。
-        # normalize the depth map to [0, 1] across the whole video
-        # 段边界(尤其末段) DepthCrafter 会吐常数/NaN 深度 → normalize 除零(max==min)→NaN
-        # 旧 nan_to_num(nan=0) 只防崩, 但 depth→0 → splatting 全错位 → 整段黑帧(seg2 97%黑)
-        # 修: epsilon 防除零; depth 退化时填中性 0.5, 保 splatting 有视差不黑
-        res = np.nan_to_num(res, nan=0.5, posinf=1.0, neginf=0.0)
         rng = float(res.max() - res.min())
         if rng < 1e-6:
-            print(f"[depth] WARN: depth 退化(max==min={res.max():.4f}), 填中性0.5防黑帧", flush=True)
             res = np.full_like(res, 0.5)
         else:
             res = (res - res.min()) / rng
