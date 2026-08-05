@@ -27,14 +27,21 @@ cd "$SC"
 
 BASE=$(basename "$IN_VIDEO" .mp4)
 
-# ---- Step 1: DepthCrafter 深度 + forward-warp splatting ----
-CUDA_VISIBLE_DEVICES=$GPU python depth_splatting_inference.py \
-  --pre_trained_path $W/stable-video-diffusion-img2vid-xt-1-1 \
-  --unet_path $W/DepthCrafter \
-  --input_video_path "$IN_VIDEO" \
-  --output_video_path $OUT/splatting_results.mp4 \
-  --max_disp $MAXDISP \
-  > $OUT/stage1.log 2>&1
+# ---- Step 1: DepthCrafter 深度 + forward-warp splatting (OOM retry) ----
+# DepthCrafter 并发峰值偶发 OOM: max_split_size_mb=128 减碎片 + 失败重跑 (GPU 释放后该成功)
+for _att in 1 2 3; do
+  CUDA_VISIBLE_DEVICES=$GPU PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 \
+    python depth_splatting_inference.py \
+    --pre_trained_path $W/stable-video-diffusion-img2vid-xt-1-1 \
+    --unet_path $W/DepthCrafter \
+    --input_video_path "$IN_VIDEO" \
+    --output_video_path $OUT/splatting_results.mp4 \
+    --max_disp $MAXDISP \
+    > $OUT/stage1.log 2>&1 && break
+  [ "$_att" = 3 ] && { echo "[seg] Step1 attempt $_att 失败: $(grep -m1 OutOfMemory $OUT/stage1.log 2>/dev/null || head -1 $OUT/stage1.log)"; exit 1; }
+  echo "[seg] Step1 attempt $_att 失败 (OOM?), 清显存重跑..."
+  sleep 5
+done
 echo "[seg] Step1 depth+splatting done (max_disp=$MAXDISP)"
 
 # ---- Step 2: 右眼 inpainting (tile_num=2, 竖屏quadrant 1024x1920) ----
