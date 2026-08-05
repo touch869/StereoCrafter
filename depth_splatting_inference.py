@@ -160,7 +160,14 @@ class DepthCrafterDemo:
         # normalize the depth map to [0, 1] across the whole video
         rng = float(res.max() - res.min())
         if rng < 1e-6:
-            res = np.full_like(res, 0.5)
+            # 兜底: 均匀 0.5 致 splatting disp 均匀 → forward_warp(ones) 全覆盖 →
+            # occlu_map 全 0 → inpainting mask 全 0 (OOD, SVD 训练只见 0/1 混合 mask)
+            # → SVD 输出整段黑 (example_fix seg2 实测 sbs 右眼黑 141/150 帧)。
+            # 改: 沿宽度线性梯度 (0.1→0.9) 模拟 depth 空间变化, splatting 左覆盖右空洞,
+            # mask 0/1 混合 → inpainting 正常填空洞, 防黑 (该段 3D 失真但不黑)。
+            _T, _H, _W = res.shape
+            _grad = np.linspace(0.1, 0.9, _W, dtype=np.float32)
+            res = np.broadcast_to(_grad[None, None, :], (_T, _H, _W)).copy()
         else:
             res = (res - res.min()) / rng
         # visualize the depth map and save the results
