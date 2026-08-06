@@ -57,10 +57,6 @@ else
   ffmpeg -y -v error -i "$INPUT" -vf "scale=1080:1920" -c:v libx264 -crf 18 -c:a copy "$AUTO"
 fi
 echo "[0] _auto.mp4: $(ffprobe -v error -show_entries stream=width,height -of csv=p=0 "$AUTO")"
-# 源 fps: 切片 + concat trim 都 -r 保持, 防 fps 膨胀 (libx264 默认 25fps 重采样
-# 致 20fps 源 150帧→186帧膨胀, 各段帧数/fps 异常 → concat 错位黑段)
-AUTO_FPS=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$AUTO" 2>/dev/null)
-echo "[0] _auto fps=$AUTO_FPS (切片+trim 保持)"
 
 # ---- 切片: 按 chunk-frames + overlap 切成 NUM_GPUS 段 ----
 TOTAL_FR=$(ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames -of csv=p=0 "$AUTO" 2>/dev/null | tail -1)
@@ -114,7 +110,7 @@ for ((i=0; i<NSEG; i++)); do
     echo "[seg$i] 切片 frames [${SEG_START[$i]}:${SEG_END[$i]}]"
     ffmpeg -y -v error -i "$AUTO" \
       -vf "select=between(n\,${SEG_START[$i]}\,$((${SEG_END[$i]}-1))),setpts=PTS-STARTPTS" \
-      -r "$AUTO_FPS" -c:v libx264 -crf 18 -an "$SEG_MP4"
+      -c:v libx264 -crf 18 -an "$SEG_MP4"
   fi
 done
 
@@ -183,7 +179,7 @@ for i in "${!SEG_FILES[@]}"; do
     SEG_USE="$OUT/seg${i}_trimmed.mp4"
     ffmpeg -y -v error -i "$SEG_FBS" \
       -vf "select='gte(n\,${OVERLAP})',setpts=PTS-STARTPTS" \
-      -r "$AUTO_FPS" -c:v libx264 -crf 16 -an "$SEG_USE" 2>/dev/null
+      -c:v libx264 -crf 16 -an "$SEG_USE" 2>/dev/null
   fi
   echo "file '$SEG_USE'" >> "$CONCAT_LIST"
 done
