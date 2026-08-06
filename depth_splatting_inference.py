@@ -313,7 +313,8 @@ def main(
     pre_trained_path: str,
     max_disp: float = 20.0,
     process_length = -1,
-    batch_size = 10
+    batch_size = 10,
+    save_depth: bool = False,
 ):
     depthcrafter_demo = DepthCrafterDemo(
         unet_path=unet_path,
@@ -323,7 +324,8 @@ def main(
     video_depth, depth_vis = depthcrafter_demo.infer(
         input_video_path,
         output_video_path,
-        process_length
+        process_length,
+        save_depth=save_depth,
     )
 
     DepthSplatting(

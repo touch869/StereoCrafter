@@ -29,6 +29,8 @@ BASE=$(basename "$IN_VIDEO" .mp4)
 
 # ---- Step 1: DepthCrafter 深度 + forward-warp splatting (OOM retry) ----
 # DepthCrafter 并发峰值偶发 OOM: max_split_size_mb=128 减碎片 + 失败重跑 (GPU 释放后该成功)
+# --save_depth=True: 落盘 splatting_results.npz (depth 原数组) + _depth_vis.mp4,
+# 配合 --keep 保留中间产物, 便于 depth 退化/OOD 诊断
 for _att in 1 2 3; do
   CUDA_VISIBLE_DEVICES=$GPU PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 \
     python depth_splatting_inference.py \
@@ -37,12 +39,23 @@ for _att in 1 2 3; do
     --input_video_path "$IN_VIDEO" \
     --output_video_path $OUT/splatting_results.mp4 \
     --max_disp $MAXDISP \
+    --save_depth=True \
     > $OUT/stage1.log 2>&1 && break
   [ "$_att" = 3 ] && { echo "[seg] Step1 attempt $_att 失败: $(grep -m1 OutOfMemory $OUT/stage1.log 2>/dev/null || head -1 $OUT/stage1.log)"; exit 1; }
   echo "[seg] Step1 attempt $_att 失败 (OOM?), 清显存重跑..."
   sleep 5
 done
 echo "[seg] Step1 depth+splatting done (max_disp=$MAXDISP)"
+
+# ---- 中间产物拆存: grid 四象限裁成单独 mp4, 便于直接查看 (配合 --keep) ----
+# splatting_results.mp4 2×2: TL=左眼原图 TR=depth_vis BL=occlu_mask BR=warped右眼
+GW=$(ffprobe -v error -select_streams v:0 -show_entries stream=width  -of csv=p=0 $OUT/splatting_results.mp4)
+GH=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 $OUT/splatting_results.mp4)
+GW2=$((GW/2)); GH2=$((GH/2))
+ffmpeg -y -v error -i $OUT/splatting_results.mp4 -vf "crop=${GW2}:${GH2}:${GW2}:0"     -c:v libx264 -crf 16 $OUT/debug_depth_vis.mp4
+ffmpeg -y -v error -i $OUT/splatting_results.mp4 -vf "crop=${GW2}:${GH2}:0:${GH2}"    -c:v libx264 -crf 16 $OUT/debug_occlu_mask.mp4
+ffmpeg -y -v error -i $OUT/splatting_results.mp4 -vf "crop=${GW2}:${GH2}:${GW2}:${GH2}" -c:v libx264 -crf 16 $OUT/debug_warped_right.mp4
+echo "[seg] 中间产物拆存: debug_depth_vis/debug_occlu_mask/debug_warped_right.mp4"
 
 # ---- Step 2: 右眼 inpainting (tile_num=2, 竖屏quadrant 1024x1920) ----
 CUDA_VISIBLE_DEVICES=$GPU python inpainting_inference.py \
