@@ -116,24 +116,26 @@ done
 
 # ---- Phase C: GPU 工作池 (段轮流分配, 每卡串行, 全卡并行) ----
 # 段数 > 卡数: 多出的段在各卡排队 (同卡串行) → 不漏覆盖; 段数 < 卡数: 多出的卡空闲
-run_one_segment() {   # $1=段idx  $2=真实GPU id
+# 单段失败(cuDNN崩/OOM/黑)不中止同卡后续段, Phase C2 统一收集+清产物+独占重跑
+run_one_segment() {   # $1=段idx  $2=真实GPU id → 0=ok 1=fail
   local idx="$1" gpu="$2"
   local seg_dir="$OUT/seg${idx}"
   [ -f "$seg_dir/final_sbs.mp4" ] && { echo "[seg$idx] RESUME skip (gpu=$gpu)"; return 0; }
   echo "[seg$idx] 启动 SC pipeline (gpu=$gpu)"
-  bash "$SCRIPT_DIR/run_sc_segment.sh" "$seg_dir/seg${idx}.mp4" \
+  if bash "$SCRIPT_DIR/run_sc_segment.sh" "$seg_dir/seg${idx}.mp4" \
     --out "$seg_dir" --gpu "$gpu" --max-disp "$MAXDISP" --tile "$TILE" \
-    > "$seg_dir/seg.log" 2>&1
+    > "$seg_dir/seg.log" 2>&1; then
+    return 0
+  else
+    echo "[seg$idx] FAIL (gpu=$gpu, rc=$?) — 记录待 Phase C2 重试"
+    return 1
+  fi
 }
 gpu_worker() {        # $1=真实GPU id  剩余 $@=该卡要跑的段idx列表
   local gpu="$1"; shift
   for idx in "$@"; do
-    if ! run_one_segment "$idx" "$gpu"; then
-      echo "[gpu=$gpu] ERROR: seg$idx 失败 (见 $OUT/seg${idx}/seg.log)"
-      return 1
-    fi
+    run_one_segment "$idx" "$gpu" || true   # 不因单段失败中止同卡后续段
   done
-  return 0
 }
 
 # 轮流(round-robin)分配: 卡 g 负责 seg{g, g+NUM_GPUS, g+2*NUM_GPUS, ...}
@@ -148,22 +150,19 @@ for g in "${!GPU_ARR[@]}"; do
   PIDS+=($!)
 done
 
-# ---- 等所有 GPU 工作进程完成 ----
+# ---- 等所有 GPU 工作进程完成 (崩溃不 fatal, Phase C2 兜底) ----
 echo "[parallel] 等待 ${#PIDS[@]} 个 GPU 工作进程 (共 $NSEG 段)..."
-FAIL=0
 for pid in "${PIDS[@]}"; do
-  if ! wait "$pid"; then
-    echo "[parallel] ERROR: 工作进程 $pid 失败"
-    FAIL=1
-  fi
+  wait "$pid" || true
 done
-[ "$FAIL" = 1 ] && { echo "ERROR: 至少一段失败, 详见各 seg/seg.log"; exit 1; }
 
-# ---- Phase C2: 段级自检 + 黑段清产物独占重跑 ----
-# DepthCrafter 并发下偶发整段退化 (段内 3 次重跑仍 max==min, stage1.log 实锤),
-# 兜底假 depth (0.5 或空间梯度) 造出的 mask (全0或条纹) 对 SVD 都 OOD → 段全黑
-# (example_fix4 seg2 两次生产连发黑 161 帧; seg2_test 独占跑 0 黑证明独占路径有效)。
-# 故: 全部段跑完(=GPU 空闲)后验证, 黑段清产物串行独占重跑, 大概率不再退化。
+# ---- Phase C2: 段级自检 + 失败/黑段清产物独占重跑 ----
+# 两种失败模式 (同为 depth 退化触发):
+#   (a) 全0 mask → SVD OOD → fp16 NaN → 整段黑 (final_sbs 59KB, YAVG=16)
+#   (b) gradient mask → cuDNN 数值崩溃 CUDNN_STATUS_EXECUTION_FAILED (final_sbs 缺失)
+# 均源自 seg2 DepthCrafter 并发整段退化(3 次重跑仍 max==min)。
+# 独占跑(此时 GPU 全空闲)大概率不退化 (seg2_test 实测 0 黑)。
+# 故: 全部段跑完→逐段验证→失败/黑段 清产物+独占重跑→再验证→仍失败报错。
 seg_verify() {  # $1=段idx → 0=正常 1=黑段
   local idx="$1" f="$OUT/seg$1/final_sbs.mp4"
   [ -f "$f" ] || { echo "[seg$idx] verify: FAIL final_sbs 缺失"; return 1; }
