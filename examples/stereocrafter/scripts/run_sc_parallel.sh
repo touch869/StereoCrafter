@@ -159,6 +159,58 @@ for pid in "${PIDS[@]}"; do
 done
 [ "$FAIL" = 1 ] && { echo "ERROR: 至少一段失败, 详见各 seg/seg.log"; exit 1; }
 
+# ---- Phase C2: 段级自检 + 黑段清产物独占重跑 ----
+# DepthCrafter 并发下偶发整段退化 (段内 3 次重跑仍 max==min, stage1.log 实锤),
+# 兜底假 depth (0.5 或空间梯度) 造出的 mask (全0或条纹) 对 SVD 都 OOD → 段全黑
+# (example_fix4 seg2 两次生产连发黑 161 帧; seg2_test 独占跑 0 黑证明独占路径有效)。
+# 故: 全部段跑完(=GPU 空闲)后验证, 黑段清产物串行独占重跑, 大概率不再退化。
+seg_verify() {  # $1=段idx → 0=正常 1=黑段
+  local idx="$1" f="$OUT/seg$1/final_sbs.mp4"
+  [ -f "$f" ] || { echo "[seg$idx] verify: FAIL final_sbs 缺失"; return 1; }
+  local sz frames bpf black
+  sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+  frames=$(ffprobe -v error -select_streams v:0 -show_entries stream=nb_frames -of csv=p=0 "$f" 2>/dev/null)
+  frames=${frames//[^0-9]/}; frames=${frames:-0}
+  # 每帧字节数: 正常 186帧段 ~46KB/帧; 全黑段 ~318B/帧 (59KB/186)。<2KB/帧 判黑
+  bpf=$(( frames > 0 ? sz / frames : 0 ))
+  if [ "$bpf" -lt 2000 ]; then
+    echo "[seg$idx] verify: FAIL 每帧 ${bpf}B < 2KB (${sz}B/${frames}帧, 全黑压缩特征)"
+    return 1
+  fi
+  # YAVG=16 (YUV limited-range 纯黑) 帧数 > 20% 判黑
+  black=$(ffmpeg -v error -i "$f" -vf "signalstats,metadata=print:file=-" -f null - 2>&1 | grep -cE "YAVG=16$" || true)
+  black=${black//[^0-9]/}; black=${black:-0}
+  if [ "$frames" -gt 0 ] && [ "$black" -gt $(( frames / 5 )) ]; then
+    echo "[seg$idx] verify: FAIL 纯黑帧 $black/$frames > 20%"
+    return 1
+  fi
+  echo "[seg$idx] verify: OK (${sz}B/${frames}帧, 黑帧 ${black})"
+  return 0
+}
+echo "[verify] 段级自检开始"
+for _round in 1 2; do
+  BAD=()
+  for ((i=0; i<NSEG; i++)); do
+    seg_verify "$i" || BAD+=("$i")
+  done
+  if [ ${#BAD[@]} -eq 0 ]; then
+    echo "[verify] 全部段正常 (round $_round)"
+    break
+  fi
+  if [ "$_round" = 2 ]; then
+    echo "ERROR: 段 ${BAD[*]} 独占重跑后仍黑, 需人工介入"; exit 1
+  fi
+  echo "[verify] 黑段: ${BAD[*]} → 清产物串行独占重跑 (GPU${GPU_ARR[0]}, 此时全空闲)"
+  for idx in "${BAD[@]}"; do
+    rm -f "$OUT/seg${idx}"/final_sbs.mp4 "$OUT/seg${idx}"/final_sbs_SWAPPED.mp4 \
+          "$OUT/seg${idx}"/splatting_results*.mp4 "$OUT/seg${idx}"/left_pass* \
+          "$OUT/seg${idx}"/svd_left.mp4 "$OUT/seg${idx}"/svd_right.mp4
+    if ! run_one_segment "$idx" "${GPU_ARR[0]}"; then
+      echo "ERROR: seg$idx 独占重跑失败 (见 $OUT/seg${idx}/seg.log)"; exit 1
+    fi
+  done
+done
+
 # ---- 拼接: concat 各段 final_sbs, overlap 区去重(取前段尾部) ----
 # 每段 final_sbs 帧数 = 该段 seg.mp4 帧数; overlap 区 = 段尾部 OVERLAP 帧
 # 去重: 段 i 去掉前 OVERLAP 帧(除了 seg0), concat 剩余
