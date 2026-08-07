@@ -155,7 +155,7 @@ class DepthCrafterDemo:
                 print(f"[depth] WARN: depth 退化(max==min={res.max():.4f}, 偶发NaN), 重跑 DepthCrafter attempt {attempt+1}/{MAX_RETRY}", flush=True)
                 res = _run_depthcrafter()
             else:
-                print(f"[depth] WARN: {MAX_RETRY}次重跑仍退化, 填中性0.5兜底 (该段右眼可能黑帧)", flush=True)
+                print(f"[depth] WARN: {MAX_RETRY}次重跑仍退化, 填空间梯度兜底 (run_sc_segment.sh 将上下文扩展重跑, gradient 仅作最后防线)", flush=True)
 
         # normalize the depth map to [0, 1] across the whole video
         rng = float(res.max() - res.min())

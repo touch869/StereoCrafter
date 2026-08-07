@@ -124,6 +124,7 @@ run_one_segment() {   # $1=段idx  $2=真实GPU id → 0=ok 1=fail
   echo "[seg$idx] 启动 SC pipeline (gpu=$gpu)"
   if bash "$SCRIPT_DIR/run_sc_segment.sh" "$seg_dir/seg${idx}.mp4" \
     --out "$seg_dir" --gpu "$gpu" --max-disp "$MAXDISP" --tile "$TILE" \
+    --auto-video "$AUTO" --frame-start "${SEG_START[$idx]}" --frame-end "${SEG_END[$idx]}" \
     > "$seg_dir/seg.log" 2>&1; then
     return 0
   else
